@@ -1,0 +1,60 @@
+services:
+  mem0-store:
+    image: qdrant/qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - mem0_storage:/qdrant/storage
+
+  openmemory-api:
+    image: openmemory-api-local
+    build:
+      context: ../vendor/mem0/openmemory/api
+    restart: unless-stopped
+    env_file:
+      - ./openmemory.env
+    environment:
+      DATABASE_URL: sqlite:////data/openmemory.db
+    volumes:
+      - openmemory_db:/data
+    depends_on:
+      - mem0-store
+    ports:
+      - "8765:8765"
+
+  openmemory-ui:
+    image: openmemory-ui-local
+    build:
+      context: ../vendor/mem0/openmemory/ui
+    restart: unless-stopped
+    depends_on:
+      - openmemory-api
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8765
+      NEXT_PUBLIC_USER_ID: ${OPENMEMORY_USER_ID:-default_user}
+    ports:
+      - "3000:3000"
+
+  mem0-gateway:
+    image: mem0-gateway-local
+    build:
+      context: ..
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY package.json package-lock.json ./
+        RUN npm ci --omit=dev
+        COPY src ./src
+        EXPOSE 8001
+        CMD ["node", "src/server.js"]
+    env_file:
+      - ../.env
+    depends_on:
+      - openmemory-api
+    ports:
+      - "8001:8001"
+
+volumes:
+  mem0_storage:
+  openmemory_db:

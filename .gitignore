@@ -73,6 +73,9 @@ librechat.yml
 # Environment
 .npmrc
 .env*
+mem0-gateway/compose/mem0.env
+mem0-gateway/compose/openmemory.env
+mem0-gateway/vendor/
 my.secrets
 !**/.env.example
 !**/.env.test.example
