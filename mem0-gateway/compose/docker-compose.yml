@@ -23,18 +23,20 @@ services:
     ports:
       - "8765:8765"
 
-  openmemory-ui:
-    image: openmemory-ui-local
-    build:
-      context: ../vendor/mem0/openmemory/ui
+  neo4j:
+    image: neo4j:5
     restart: unless-stopped
-    depends_on:
-      - openmemory-api
+    profiles: ["graph"]
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8765
-      NEXT_PUBLIC_USER_ID: ${OPENMEMORY_USER_ID:-default_user}
+      NEO4J_AUTH: neo4j/change-me
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
     ports:
-      - "3000:3000"
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
 
   mem0-gateway:
     image: mem0-gateway-local
@@ -58,3 +60,4 @@ services:
 volumes:
   mem0_storage:
   openmemory_db:
+  neo4j_data:
