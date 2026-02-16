@@ -61,6 +61,11 @@ const config = {
     .filter(Boolean),
   mem0AddRetries: Math.max(0, Number(process.env.MEM0_ADD_RETRIES || 2)),
   mem0AddRetryDelayMs: Math.max(0, Number(process.env.MEM0_ADD_RETRY_DELAY_MS || 500)),
+  mem0ForgetEnabled: process.env.MEM0_FORGET_ENABLED !== 'false',
+  mem0ForgetMaxDeletions: Math.max(1, Number(process.env.MEM0_FORGET_MAX_DELETIONS || 20)),
+  mem0ForgetMinScore: Number(process.env.MEM0_FORGET_MIN_SCORE || 0),
+  mem0ForgetPasses: Math.max(1, Number(process.env.MEM0_FORGET_PASSES || 2)),
+  mem0ForgetSettleMs: Math.max(0, Number(process.env.MEM0_FORGET_SETTLE_MS || 1200)),
   mem0CustomFactExtractionPrompt: process.env.MEM0_CUSTOM_FACT_EXTRACTION_PROMPT || '',
   mem0CustomUpdatePrompt: process.env.MEM0_CUSTOM_UPDATE_MEMORY_PROMPT || '',
   openmemoryUserId: process.env.OPENMEMORY_USER_ID || '',
@@ -80,12 +85,61 @@ const log = {
 };
 
 const pendingMemoryWritesByScope = new Map();
+const forgottenTopicTokensByScope = new Map();
 
 function getScopeQueueKey(scope) {
   const user = scope?.userId || '-';
   const agent = scope?.agentId || '-';
   const run = scope?.runId || '-';
   return `${user}:${agent}:${run}`;
+}
+
+function getScopeMemoryKey(scope) {
+  return getScopeQueueKey(scope);
+}
+
+function getForgottenTopicTokens(scope) {
+  const key = getScopeMemoryKey(scope);
+  const stored = forgottenTopicTokensByScope.get(key);
+  if (!stored) return [];
+  return Array.from(stored);
+}
+
+function rememberForgottenTopic(scope, tokens) {
+  if (!scope || !Array.isArray(tokens) || tokens.length === 0) return;
+  const key = getScopeMemoryKey(scope);
+  const existing = forgottenTopicTokensByScope.get(key) || new Set();
+  for (const token of tokens) {
+    if (!token) continue;
+    existing.add(token);
+  }
+  forgottenTopicTokensByScope.set(key, existing);
+}
+
+function clearForgottenTopics(scope) {
+  if (!scope) return;
+  const key = getScopeMemoryKey(scope);
+  forgottenTopicTokensByScope.delete(key);
+}
+
+function releaseForgottenTopicsFromText(scope, text) {
+  if (!scope || typeof text !== 'string' || !text.trim()) return;
+  const key = getScopeMemoryKey(scope);
+  const existing = forgottenTopicTokensByScope.get(key);
+  if (!existing || existing.size === 0) return;
+
+  const normalized = text.toLowerCase();
+  for (const token of Array.from(existing)) {
+    if (normalized.includes(token)) {
+      existing.delete(token);
+    }
+  }
+
+  if (existing.size === 0) {
+    forgottenTopicTokensByScope.delete(key);
+  } else {
+    forgottenTopicTokensByScope.set(key, existing);
+  }
 }
 
 function enqueueMemoryWrite(scope, writeTask) {
@@ -151,6 +205,76 @@ function parseNumberValue(value) {
 function sleep(ms) {
   if (!ms || ms <= 0) return Promise.resolve();
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const FORGET_TOPIC_STOP_WORDS = new Set([
+  'about',
+  'that',
+  'this',
+  'with',
+  'from',
+  'your',
+  'my',
+  'me',
+  'you',
+  'know',
+  'remember',
+  'memory',
+  'memories',
+  'everything',
+  'anything',
+  'all',
+]);
+
+function normalizeFreeText(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function cleanForgetTopic(topic) {
+  return normalizeFreeText(topic)
+    .replace(/^['"`]+/, '')
+    .replace(/['"`.,!?;:]+$/, '');
+}
+
+function extractForgetIntent(text) {
+  const normalized = normalizeFreeText(text).toLowerCase();
+  if (!normalized) return null;
+
+  const commandPrefix = normalized.match(/^(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?(forget|delete|remove|erase|clear)\b/);
+  if (!commandPrefix) return null;
+
+  if (/\b(?:all|everything)\b.*\b(?:memory|memories|know|remember)\b/.test(normalized) && /\babout me\b/.test(normalized)) {
+    return { deleteAll: true, topic: '' };
+  }
+
+  const aboutMatch = normalized.match(
+    /^(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?(?:forget|delete|remove|erase|clear)\b(?:\s+(?:all|everything|anything))?(?:\s+(?:you\s+know|you\s+remember|memory|memories))?(?:\s+(?:about|regarding|on|for))\s+(.+)$/,
+  );
+  if (aboutMatch?.[1]) {
+    return { deleteAll: false, topic: cleanForgetTopic(aboutMatch[1]) };
+  }
+
+  const thatMatch = normalized.match(
+    /^(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?(?:forget|delete|remove|erase|clear)\s+that\s+(.+)$/,
+  );
+  if (thatMatch?.[1]) {
+    return { deleteAll: false, topic: cleanForgetTopic(thatMatch[1]) };
+  }
+
+  if (/\b(?:all|everything)\b/.test(normalized)) {
+    return { deleteAll: true, topic: '' };
+  }
+
+  return { deleteAll: false, topic: '' };
+}
+
+function tokenizeForgetTopic(topic) {
+  if (!topic) return [];
+  return normalizeFreeText(topic)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length >= 3 && !FORGET_TOPIC_STOP_WORDS.has(token));
 }
 
 function getImageUrlFromPart(part) {
@@ -655,30 +779,112 @@ function relationToString(relation) {
   return '';
 }
 
-function toMemoryStrings(data, threshold, maxItems) {
-  let items = [];
+function getSearchItems(data) {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.memories)) return data.memories;
+  if (Array.isArray(data?.results)) return data.results;
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.items)) return data.items;
+  return [];
+}
 
-  if (Array.isArray(data)) {
-    items = data;
-  } else if (Array.isArray(data?.memories)) {
-    items = data.memories;
-  } else if (Array.isArray(data?.results)) {
-    items = data.results;
-  } else if (Array.isArray(data?.data)) {
-    items = data.data;
-  } else if (Array.isArray(data?.items)) {
-    items = data.items;
+function getMemoryTextFromItem(item) {
+  if (!item || typeof item !== 'object') return '';
+  return item.memory || item.value || item.text || item.content || item.data || '';
+}
+
+function getMemoryScoreFromItem(item) {
+  const candidate = item?.score;
+  if (typeof candidate === 'number' && Number.isFinite(candidate)) return candidate;
+  return null;
+}
+
+function getMemoryTimestampMs(item) {
+  const candidates = [item?.updated_at, item?.created_at, item?.updatedAt, item?.createdAt, item?.timestamp];
+  for (const value of candidates) {
+    if (!value) continue;
+    const parsed = Number.isFinite(value) ? Number(value) : Date.parse(String(value));
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
   }
+  return 0;
+}
 
-  const memoryLines = items
-    .filter((item) => {
-      if (typeof item?.score === 'number') {
-        return item.score >= threshold;
+function normalizeMemoryRecords(data, threshold) {
+  const items = getSearchItems(data);
+  return items
+    .map((item) => ({
+      id: item?.id || item?.memory_id || item?.uuid || '',
+      text: getMemoryTextFromItem(item),
+      score: getMemoryScoreFromItem(item),
+      timestampMs: getMemoryTimestampMs(item),
+      metadata: item?.metadata,
+    }))
+    .filter((record) => {
+      if (!record.text) return false;
+      if (typeof record.score === 'number') {
+        return record.score >= threshold;
       }
       return true;
     })
-    .map((item) => item?.memory || item?.value || item?.text || item?.content || '')
-    .filter(Boolean);
+    .sort((a, b) => {
+      if (b.timestampMs !== a.timestampMs) return b.timestampMs - a.timestampMs;
+      const scoreA = typeof a.score === 'number' ? a.score : -Infinity;
+      const scoreB = typeof b.score === 'number' ? b.score : -Infinity;
+      return scoreB - scoreA;
+    });
+}
+
+function textContainsAnyToken(text, tokens) {
+  if (!text || !Array.isArray(tokens) || tokens.length === 0) return false;
+  const normalized = String(text).toLowerCase();
+  return tokens.some((token) => normalized.includes(token));
+}
+
+function relationContainsForgottenTopic(relation, tokens) {
+  if (!relation || tokens.length === 0) return false;
+  if (textContainsAnyToken(relationToString(relation), tokens)) return true;
+  const rawFields = [
+    relation?.source,
+    relation?.target,
+    relation?.relationship,
+    relation?.type,
+    relation?.memory,
+    relation?.source_entity,
+    relation?.target_entity,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return textContainsAnyToken(rawFields, tokens);
+}
+
+function applyScopeForgetFiltersToSearchData(scope, data) {
+  if (!data || typeof data !== 'object') return data;
+  const forgottenTokens = getForgottenTopicTokens(scope);
+  if (forgottenTokens.length === 0) return data;
+
+  const next = { ...data };
+
+  const filterItems = (items) =>
+    items.filter((item) => {
+      const memoryText = getMemoryTextFromItem(item);
+      return !textContainsAnyToken(memoryText, forgottenTokens);
+    });
+
+  if (Array.isArray(next.results)) next.results = filterItems(next.results);
+  if (Array.isArray(next.memories)) next.memories = filterItems(next.memories);
+  if (Array.isArray(next.items)) next.items = filterItems(next.items);
+  if (Array.isArray(next.data)) next.data = filterItems(next.data);
+  if (Array.isArray(next.relations)) {
+    next.relations = next.relations.filter((relation) => !relationContainsForgottenTopic(relation, forgottenTokens));
+  }
+
+  return next;
+}
+
+function toMemoryStrings(data, threshold, maxItems) {
+  const memoryLines = normalizeMemoryRecords(data, threshold).map((record) => record.text);
 
   const relationLines = config.mem0IncludeRelationsInPrompt && Array.isArray(data?.relations)
     ? data.relations.map(relationToString).filter(Boolean)
@@ -748,6 +954,7 @@ async function mem0Search({ scope, query, req, body }) {
 
       return items
         .map((item) => item?.content || item?.text || item?.memory || item?.value || '')
+        .filter((item) => !textContainsAnyToken(item, getForgottenTopicTokens(scope)))
         .filter(Boolean)
         .slice(0, config.mem0MaxMemories);
     }
@@ -782,7 +989,8 @@ async function mem0Search({ scope, query, req, body }) {
       }
 
       const data = await response.json();
-      return toMemoryStrings(data, requestOptions.threshold, config.mem0MaxMemories);
+      const filteredData = applyScopeForgetFiltersToSearchData(scope, data);
+      return toMemoryStrings(filteredData, requestOptions.threshold, config.mem0MaxMemories);
     }
 
     const url = new URL(`${apiBase}/memories/search`);
@@ -804,11 +1012,270 @@ async function mem0Search({ scope, query, req, body }) {
     }
 
     const data = await response.json();
-    return toMemoryStrings(data, config.mem0Threshold, config.mem0MaxMemories);
+    const filteredData = applyScopeForgetFiltersToSearchData(scope, data);
+    return toMemoryStrings(filteredData, config.mem0Threshold, config.mem0MaxMemories);
   } catch (error) {
     log.warn('Mem0 search error', error.message);
     return [];
   }
+}
+
+async function mem0SearchRecords({ scope, query, req, body, topKOverride, thresholdOverride }) {
+  if (!config.mem0Enabled || !scope?.userId || !query) return [];
+
+  const apiBase = normalizeBaseUrl(config.mem0ApiBase);
+  const requestOptions = getMem0RequestOptions(req, body);
+  const requestFilters = parseJsonHeader(req, 'x-mem0-filters', {});
+  const bodyFilters = body?.mem0?.filters && typeof body.mem0.filters === 'object' ? body.mem0.filters : {};
+  const scopeFilters = getScopeFilters(scope);
+  const mergedFilters = mergeFiltersWithScope(
+    scopeFilters,
+    mergeFiltersWithScope(config.mem0SearchFilters, mergeFiltersWithScope(requestFilters, bodyFilters)),
+  );
+
+  const topK = Math.max(1, Math.floor(topKOverride ?? requestOptions.topK));
+  const threshold = thresholdOverride ?? requestOptions.threshold;
+
+  try {
+    if (config.mem0Mode === 'openmemory' || config.mem0ApiFlavor === 'openmemory_legacy') {
+      const url = new URL(`${apiBase}/api/v1/memories/`);
+      url.searchParams.set('user_id', scope.userId);
+      url.searchParams.set('search_query', query);
+      url.searchParams.set('page', '1');
+      url.searchParams.set('size', String(topK));
+
+      const response = await fetchWithTimeout(
+        url.toString(),
+        {
+          method: 'GET',
+          headers: buildMem0Headers(),
+        },
+        config.mem0TimeoutMs,
+      );
+
+      if (!response.ok) {
+        log.warn('OpenMemory search for deletion failed', response.status, await response.text());
+        return [];
+      }
+
+      const data = await response.json();
+      return normalizeMemoryRecords(Array.isArray(data?.items) ? data.items : [], threshold);
+    }
+
+    const response = await fetchWithTimeout(
+      `${apiBase}/v2/memories/search/`,
+      {
+        method: 'POST',
+        headers: buildMem0Headers(),
+        body: JSON.stringify({
+          query,
+          version: 'v2',
+          filters: mergedFilters,
+          top_k: topK,
+          threshold,
+          rerank: false,
+          keyword_search: requestOptions.keywordSearch,
+          filter_memories: requestOptions.filterMemories,
+          enable_graph: requestOptions.enableGraph,
+          org_id: scope.orgId || undefined,
+          project_id: scope.projectId || undefined,
+        }),
+      },
+      config.mem0TimeoutMs,
+    );
+
+    if (!response.ok) {
+      log.warn('Mem0 search for deletion failed', response.status, await response.text());
+      return [];
+    }
+
+    const data = await response.json();
+    return normalizeMemoryRecords(data, threshold);
+  } catch (error) {
+    log.warn('Mem0 search for deletion error', error.message);
+    return [];
+  }
+}
+
+async function mem0ListScopeRecords({ scope, pageSize }) {
+  if (!config.mem0Enabled || !scope?.userId) return [];
+
+  const apiBase = normalizeBaseUrl(config.mem0ApiBase);
+  const limit = Math.max(1, Math.floor(pageSize || config.mem0ForgetMaxDeletions));
+  const scopeFilters = getScopeFilters(scope);
+
+  try {
+    if (config.mem0Mode === 'openmemory' || config.mem0ApiFlavor === 'openmemory_legacy') {
+      const url = new URL(`${apiBase}/api/v1/memories/`);
+      url.searchParams.set('user_id', scope.userId);
+      url.searchParams.set('page', '1');
+      url.searchParams.set('size', String(limit));
+
+      const response = await fetchWithTimeout(
+        url.toString(),
+        {
+          method: 'GET',
+          headers: buildMem0Headers(),
+        },
+        config.mem0TimeoutMs,
+      );
+
+      if (!response.ok) {
+        log.warn('OpenMemory list for deletion failed', response.status, await response.text());
+        return [];
+      }
+
+      const data = await response.json();
+      return normalizeMemoryRecords(Array.isArray(data?.items) ? data.items : [], config.mem0ForgetMinScore);
+    }
+
+    const response = await fetchWithTimeout(
+      `${apiBase}/v2/memories/`,
+      {
+        method: 'POST',
+        headers: buildMem0Headers(),
+        body: JSON.stringify({
+          filters: scopeFilters,
+          page: 1,
+          page_size: limit,
+        }),
+      },
+      config.mem0TimeoutMs,
+    );
+
+    if (!response.ok) {
+      log.warn('Mem0 list for deletion failed', response.status, await response.text());
+      return [];
+    }
+
+    const data = await response.json();
+    return normalizeMemoryRecords(data, config.mem0ForgetMinScore);
+  } catch (error) {
+    log.warn('Mem0 list for deletion error', error.message);
+    return [];
+  }
+}
+
+async function mem0DeleteById(memoryId) {
+  if (!memoryId) return false;
+
+  const apiBase = normalizeBaseUrl(config.mem0ApiBase);
+  const encodedId = encodeURIComponent(memoryId);
+  const endpoints =
+    config.mem0Mode === 'openmemory' || config.mem0ApiFlavor === 'openmemory_legacy'
+      ? [`${apiBase}/api/v1/memories/${encodedId}`, `${apiBase}/api/v1/memories/${encodedId}/`]
+      : [`${apiBase}/v1/memories/${encodedId}/`, `${apiBase}/v1/memories/${encodedId}`];
+
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetchMem0WithRetry(
+        endpoint,
+        {
+          method: 'DELETE',
+          headers: buildMem0Headers(),
+        },
+        config.mem0TimeoutMs,
+        config.mem0AddRetries,
+      );
+
+      if (response.ok || response.status === 404) {
+        return response.ok;
+      }
+    } catch (error) {
+      log.warn('Mem0 delete failed', memoryId, error.message);
+    }
+  }
+
+  return false;
+}
+
+async function applyForgetIntent({ scope, userText, req, body }) {
+  if (!config.mem0ForgetEnabled || !scope?.userId || !userText) return null;
+
+  const intent = extractForgetIntent(userText);
+  if (!intent) return null;
+
+  const topicTokens = tokenizeForgetTopic(intent.topic);
+  const limit = config.mem0ForgetMaxDeletions;
+  let requestedCount = 0;
+  let deletedCount = 0;
+
+  for (let pass = 0; pass < config.mem0ForgetPasses; pass += 1) {
+    let candidates = [];
+
+    if (intent.deleteAll) {
+      // eslint-disable-next-line no-await-in-loop
+      candidates = await mem0ListScopeRecords({ scope, pageSize: limit });
+    } else {
+      const query = intent.topic || userText;
+      // eslint-disable-next-line no-await-in-loop
+      candidates = await mem0SearchRecords({
+        scope,
+        query,
+        req,
+        body,
+        topKOverride: limit,
+        thresholdOverride: config.mem0ForgetMinScore,
+      });
+    }
+
+    if (!intent.deleteAll && topicTokens.length > 0) {
+      candidates = candidates.filter((candidate) => {
+        const memoryText = String(candidate.text || '').toLowerCase();
+        return topicTokens.every((token) => memoryText.includes(token));
+      });
+    }
+
+    const uniqueCandidates = [];
+    const seen = new Set();
+    for (const candidate of candidates) {
+      if (!candidate?.id) continue;
+      if (seen.has(candidate.id)) continue;
+      seen.add(candidate.id);
+      uniqueCandidates.push(candidate);
+      if (uniqueCandidates.length >= limit) break;
+    }
+
+    requestedCount += uniqueCandidates.length;
+
+    for (const candidate of uniqueCandidates) {
+      // eslint-disable-next-line no-await-in-loop
+      const deleted = await mem0DeleteById(candidate.id);
+      if (deleted) {
+        deletedCount += 1;
+      }
+    }
+
+    if (pass + 1 >= config.mem0ForgetPasses) {
+      break;
+    }
+
+    if (uniqueCandidates.length === 0 && deletedCount === 0) {
+      break;
+    }
+
+    // Allow async background writes to settle, then run one more cleanup pass.
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(config.mem0ForgetSettleMs);
+  }
+
+  const summary =
+    intent.deleteAll
+      ? `deleted ${deletedCount} memory entries for this user scope`
+      : `deleted ${deletedCount} memory entries for topic "${intent.topic || 'request'}"`;
+  log.info('Mem0 forget intent processed', summary);
+
+  if (intent.deleteAll) {
+    clearForgottenTopics(scope);
+  } else if (topicTokens.length > 0) {
+    rememberForgottenTopic(scope, topicTokens);
+  }
+
+  return {
+    ...intent,
+    requestedCount,
+    deletedCount,
+  };
 }
 
 function extractMemoriesFromResponse(data, threshold) {
@@ -965,9 +1432,25 @@ async function mem0Add({ scope, messages, metadata, reqBody }) {
   }
 }
 
-function buildMemoryPrompt(memories) {
-  if (!memories || memories.length === 0) return '';
-  return `Relevant user memories:\n${memories.map((memory) => `- ${memory}`).join('\n')}`;
+function buildMemoryPrompt(memories, options = {}) {
+  const hasMemories = Array.isArray(memories) && memories.length > 0;
+  const hasForgetNote = options.forgetResult?.deletedCount > 0;
+  if (!hasMemories && !hasForgetNote) return '';
+
+  const lines = [];
+  if (hasMemories) {
+    lines.push('Relevant user memories (newer facts override older conflicting facts):');
+    lines.push(...memories.map((memory) => `- ${memory}`));
+  }
+
+  if (hasForgetNote) {
+    lines.push('');
+    lines.push(
+      `Memory maintenance note: user requested forgetting data and ${options.forgetResult.deletedCount} stored memory entries were deleted before this response.`,
+    );
+  }
+
+  return lines.join('\n');
 }
 
 function shouldStoreUserMessage(textContent, originalContent) {
@@ -978,6 +1461,10 @@ function shouldStoreUserMessage(textContent, originalContent) {
   if (typeof textContent !== 'string') return false;
   const text = textContent.trim();
   if (!text) return false;
+
+  if (extractForgetIntent(text)) {
+    return false;
+  }
 
   if (config.mem0StoreStrategy === 'all') {
     return true;
@@ -1227,12 +1714,16 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
   const lastUserMessageContent = lastUserMessageData.content;
 
   let memories = [];
+  let forgetResult = null;
   if (lastUserMessage && scope.userId) {
     await waitForPendingMemoryWrite(scope);
-    memories = await mem0Search({ scope, query: lastUserMessage, req, body });
+    forgetResult = await applyForgetIntent({ scope, userText: lastUserMessage, req, body });
+    if (!forgetResult) {
+      memories = await mem0Search({ scope, query: lastUserMessage, req, body });
+    }
   }
 
-  const memoryPrompt = buildMemoryPrompt(memories);
+  const memoryPrompt = buildMemoryPrompt(memories, { forgetResult });
   const nextMessages = memoryPrompt
     ? injectMemoriesIntoMessages(messages, memoryPrompt)
     : messages;
@@ -1306,6 +1797,7 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
       }
 
       if (messagesToStore.length > 0) {
+        releaseForgottenTopicsFromText(scope, lastUserMessage);
         void enqueueMemoryWrite(scope, () =>
           mem0Add({
             scope,
@@ -1344,6 +1836,7 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
   }
 
   if (messagesToStore.length > 0) {
+    releaseForgottenTopicsFromText(scope, lastUserMessage);
     void enqueueMemoryWrite(scope, () =>
       mem0Add({
         scope,
@@ -1367,12 +1860,16 @@ app.post('/v1/responses', requireApiKey, async (req, res) => {
   const lastUserMessageContent = lastUserMessageData.content;
 
   let memories = [];
+  let forgetResult = null;
   if (lastUserMessage && scope.userId) {
     await waitForPendingMemoryWrite(scope);
-    memories = await mem0Search({ scope, query: lastUserMessage, req, body });
+    forgetResult = await applyForgetIntent({ scope, userText: lastUserMessage, req, body });
+    if (!forgetResult) {
+      memories = await mem0Search({ scope, query: lastUserMessage, req, body });
+    }
   }
 
-  const memoryPrompt = buildMemoryPrompt(memories);
+  const memoryPrompt = buildMemoryPrompt(memories, { forgetResult });
   const upstreamBody = { ...body };
 
   if (memoryPrompt) {
@@ -1451,6 +1948,7 @@ app.post('/v1/responses', requireApiKey, async (req, res) => {
       }
 
       if (messagesToStore.length > 0) {
+        releaseForgottenTopicsFromText(scope, lastUserMessage);
         void enqueueMemoryWrite(scope, () =>
           mem0Add({
             scope,
@@ -1489,6 +1987,7 @@ app.post('/v1/responses', requireApiKey, async (req, res) => {
   }
 
   if (messagesToStore.length > 0) {
+    releaseForgottenTopicsFromText(scope, lastUserMessage);
     void enqueueMemoryWrite(scope, () =>
       mem0Add({
         scope,

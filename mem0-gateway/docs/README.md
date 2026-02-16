@@ -134,6 +134,11 @@ memory:
 - `MEM0_ALLOWED_IMAGE_MIME_TYPES`: comma-separated allowlist for image MIME types.
 - `MEM0_ADD_RETRIES`: retry count for transient memory write failures.
 - `MEM0_ADD_RETRY_DELAY_MS`: initial retry delay for memory writes.
+- `MEM0_FORGET_ENABLED`: enables delete-on-intent handling for user "forget/delete/remove" requests.
+- `MEM0_FORGET_MAX_DELETIONS`: max memory IDs deleted for a single forget request.
+- `MEM0_FORGET_MIN_SCORE`: minimum score used when collecting delete candidates.
+- `MEM0_FORGET_PASSES`: number of cleanup passes for forget requests (helps with async write races).
+- `MEM0_FORGET_SETTLE_MS`: wait time between forget cleanup passes.
 - `MEM0_AGENT_ID`, `MEM0_RUN_ID`, `MEM0_APP_ID`, `MEM0_ORG_ID`, `MEM0_PROJECT_ID`: default scope values.
 - `MEM0_USE_CONVERSATION_AS_RUN_ID`: map LibreChat conversation ID to `run_id`.
 - `MEM0_CUSTOM_FACT_EXTRACTION_PROMPT`: override extraction prompt (gateway/api safety layer enforces JSON + `{"facts": [...]}` response shape hints).
@@ -151,6 +156,8 @@ memory:
   unsupported image MIME types and oversized base64 payloads are filtered out before write.
 - In `mem0_compat` mode, if vision/image parsing fails upstream (for example provider returns `Invalid image data`),
   the API retries with image parts removed so text facts can still be persisted.
+- Forget commands such as "forget everything about pizza" trigger targeted memory deletion by ID before generating a reply.
+- Memory prompt injection prioritizes newer facts when older memories conflict.
 - `/v1/responses` is supported. If your upstream does not implement it, keep
   `useResponsesApi` disabled in LibreChat.
 - Default port is `8001` to avoid clashing with Mem0 OSS (default `8000`).
