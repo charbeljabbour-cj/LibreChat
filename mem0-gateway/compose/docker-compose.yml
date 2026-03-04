@@ -7,6 +7,20 @@ services:
     volumes:
       - mem0_storage:/qdrant/storage
 
+  neo4j:
+    image: neo4j:5
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/change-me
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+
   openmemory-api:
     image: openmemory-api-local
     build:
@@ -20,23 +34,9 @@ services:
       - openmemory_db:/data
     depends_on:
       - mem0-store
+      - neo4j
     ports:
       - "8765:8765"
-
-  neo4j:
-    image: neo4j:5
-    restart: unless-stopped
-    profiles: ["graph"]
-    environment:
-      NEO4J_AUTH: neo4j/change-me
-      NEO4J_apoc_export_file_enabled: "true"
-      NEO4J_apoc_import_file_enabled: "true"
-      NEO4J_dbms_security_procedures_unrestricted: apoc.*
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    volumes:
-      - neo4j_data:/data
 
   mem0-gateway:
     image: mem0-gateway-local

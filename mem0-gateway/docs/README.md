@@ -11,6 +11,7 @@ stay clean.
 - Injects those memories into the prompt.
 - Forwards the request to your upstream model provider (e.g. OpenRouter).
 - Optionally stores new memories in the selected memory backend.
+- Supports graph-aware memory via Neo4j (knowledge relationships between facts).
 
 ## Architecture
 
@@ -25,11 +26,14 @@ mem0-gateway:8001  ------>  OpenRouter (or any OpenAI-compatible API)
     v
 openmemory-api:8765
     |
-    v
-Qdrant:6333 (vector DB)
+    +------+------+
+    |             |
+    v             v
+Qdrant:6333    Neo4j:7687
+(vectors)      (graph)
 ```
 
-Three services, no extra databases.
+Four services total (plus LibreChat itself).
 
 ## Quick start
 
@@ -93,7 +97,7 @@ This starts:
 - Gateway: `http://localhost:8001`
 - OpenMemory API: `http://localhost:8765`
 - Qdrant dashboard (vector inspection): `http://localhost:6333/dashboard`
-- Neo4j browser (graph profile only): `http://localhost:7474`
+- Neo4j browser (graph inspection): `http://localhost:7474`
 
 Mem0 compatibility routes exposed by the API service:
 - `POST /v1/memories/`
@@ -104,49 +108,97 @@ Mem0 compatibility routes exposed by the API service:
 ## Azure deployment
 
 If you are hosting LibreChat on Azure (e.g. Azure Container Apps, AKS, or a VM
-with Docker), you can add the mem0 gateway alongside your existing deployment.
+with Docker Compose), you can add the mem0 gateway stack alongside your existing
+deployment. Nothing in LibreChat itself changes — you only add a custom endpoint
+in `librechat.yaml`.
 
-### What you need
+### Services to deploy
 
-| Service | Runs as | Notes |
-|---|---|---|
-| **mem0-gateway** | Container | Stateless proxy, scale horizontally |
-| **openmemory-api** | Container | Memory backend |
-| **Qdrant** | Container | Vector store, persist the volume |
+| Service | Image | Port | Persistent storage |
+|---|---|---|---|
+| **mem0-gateway** | Build from `mem0-gateway/` | 8001 | None (stateless) |
+| **openmemory-api** | Build from `mem0-gateway/vendor/mem0/openmemory/api` | 8765 | SQLite volume (`/data`) |
+| **Qdrant** | `qdrant/qdrant` | 6333 | Volume at `/qdrant/storage` |
+| **Neo4j** | `neo4j:5` | 7687 (bolt), 7474 (browser) | Volume at `/data` |
 
-All three communicate over an **internal network** (Azure VNet or Container Apps
-environment). Only LibreChat is exposed publicly.
+All four services communicate over an **internal network only**. Do not expose
+ports 8001, 8765, 6333, 7474, or 7687 publicly.
 
-### Step-by-step
+### Step 1 — Deploy the four containers
 
-1) **Add the three containers** to your existing deployment (Container Apps,
-   AKS namespace, or docker-compose on a VM). Use the same `docker-compose.yml`
-   from this repo or translate the services into your deployment manifests.
+If you are using Docker Compose on a VM, add the services from
+`mem0-gateway/compose/docker-compose.yml` to your existing compose file
+(or run it as a second compose project on the same Docker network).
 
-2) **Set environment variables** for the gateway (`.env`):
+If you are on AKS or Azure Container Apps, create deployments for each service
+in the same namespace / environment as LibreChat. Build the two custom images
+(`mem0-gateway` and `openmemory-api`) and push them to your Azure Container
+Registry.
 
-```text
+### Step 2 — Configure the gateway (`.env`)
+
+Create the gateway env file from the template and set your OpenRouter key:
+
+```env
 GATEWAY_API_KEY=<generate-a-strong-key>
+
 UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
 UPSTREAM_API_KEY=<your-openrouter-key>
 UPSTREAM_HEADERS={"HTTP-Referer":"https://your-domain","X-Title":"LibreChat"}
+
+MEM0_ENABLED=true
+MEM0_MODE=mem0_compat
+MEM0_API_BASE=http://openmemory-api:8765
+MEM0_API_FLAVOR=mem0_v2
+MEM0_SEARCH_TOP_K=6
+MEM0_THRESHOLD=0.0
+MEM0_SEARCH_THRESHOLD=0.0
+MEM0_SEARCH_RERANK=true
+MEM0_ENABLE_GRAPH=true
+MEM0_INCLUDE_RELATIONS_IN_PROMPT=true
+MEM0_STORE_MODE=user_only
+MEM0_ASYNC_MODE=true
+MEM0_FORGET_ENABLED=true
+OPENMEMORY_APP=librechat
 ```
 
-3) **Set environment variables** for OpenMemory (`openmemory.env`):
+### Step 3 — Configure OpenMemory (`openmemory.env`)
 
-```text
+```env
+USER=default_user
 OPENAI_API_KEY=<your-openrouter-key>
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 QDRANT_HOST=mem0-store
 QDRANT_PORT=6333
+MEM0_VERSION=v1.1
+MEM0_GRAPH_STORE_JSON={"provider":"neo4j","config":{"url":"neo4j://neo4j:7687","username":"neo4j","password":"<neo4j-password>"}}
 ```
 
-4) **Configure LibreChat** (`librechat.yaml`):
+The `OPENAI_API_KEY` here is used by OpenMemory for **embeddings and fact
+extraction** — it calls OpenRouter the same way the gateway does.
+
+The `MEM0_GRAPH_STORE_JSON` tells OpenMemory how to reach Neo4j for storing
+and querying knowledge-graph relationships between memories.
+
+### Step 4 — Configure Neo4j
+
+Set the Neo4j password via the `NEO4J_AUTH` environment variable on the Neo4j
+container:
+
+```env
+NEO4J_AUTH=neo4j/<neo4j-password>
+```
+
+Use the same password in `MEM0_GRAPH_STORE_JSON` above.
+
+### Step 5 — Add the custom endpoint to LibreChat
+
+In your `librechat.yaml`:
 
 ```yaml
 endpoints:
   custom:
-    - name: mem0-gateway
+    - name: "Memory Chat"
       apiKey: "${MEM0_GATEWAY_API_KEY}"
       baseURL: "http://mem0-gateway:8001/v1"
       headers:
@@ -162,24 +214,45 @@ memory:
   disabled: true
 ```
 
-5) **Store secrets** in Azure Key Vault instead of `.env` files and reference
-   them in your container configuration.
+Add `MEM0_GATEWAY_API_KEY=<same-key-from-step-2>` to LibreChat's `.env`.
 
-6) **Persist Qdrant data** by mounting a persistent volume on the `mem0-store`
-   container at `/qdrant/storage`.
+### Step 6 — Secrets management
 
-### Networking
+On Azure, store all keys in **Azure Key Vault** and reference them in your
+container configuration instead of using `.env` files:
 
-- The gateway, OpenMemory API, and Qdrant should only be reachable from within
-  your internal network. Do not expose ports 8001, 8765, or 6333 publicly.
-- LibreChat reaches the gateway over the internal network using its service name
-  (e.g. `http://mem0-gateway:8001/v1`).
+- `GATEWAY_API_KEY`
+- `UPSTREAM_API_KEY` (OpenRouter)
+- `OPENAI_API_KEY` (OpenRouter, for OpenMemory)
+- `NEO4J_AUTH` password
+
+### Step 7 — Persistent storage
+
+Attach persistent volumes (Azure Disk or Azure Files) to:
+
+| Container | Mount path | Purpose |
+|---|---|---|
+| Qdrant | `/qdrant/storage` | Vector embeddings |
+| OpenMemory | `/data` | SQLite database (`openmemory.db`) |
+| Neo4j | `/data` | Graph database |
+
+### Step 8 — Verify
+
+After deployment:
+
+1. Open LibreChat and select the **"Memory Chat"** endpoint.
+2. Send a message like "Remember that I work at ESAB".
+3. In a new conversation (same endpoint), ask "Where do I work?"
+4. The gateway should retrieve the stored memory and the model answers correctly.
+
+Check the Neo4j browser at `http://<neo4j-host>:7474` to inspect graph
+relationships (internal network only).
 
 ### Backups
 
-- **Qdrant**: back up the persistent volume (`mem0_storage`).
-- **OpenMemory**: back up `/data/openmemory.db` (SQLite file inside the
-  `openmemory_db` volume).
+- **Qdrant**: back up the `/qdrant/storage` volume.
+- **OpenMemory**: back up `/data/openmemory.db` inside the volume.
+- **Neo4j**: back up the `/data` volume or use `neo4j-admin dump`.
 
 ## LibreChat config (minimal change)
 
@@ -216,7 +289,7 @@ Gateway (`.env`):
 - `MEM0_API_FLAVOR`: `openmemory_legacy` or `mem0_v2`.
 - `MEM0_SEARCH_TOP_K`: search top-k for Mem0 platform mode.
 - `MEM0_MAX_MEMORIES`: max memories to inject.
-- `MEM0_THRESHOLD`: similarity cutoff.
+- `MEM0_THRESHOLD`: similarity cutoff (0.0 = return all matches).
 - `MEM0_SEARCH_THRESHOLD`: retrieval threshold for v2 search.
 - `MEM0_SEARCH_RERANK`: enable reranker on v2 search.
 - `MEM0_ENABLE_GRAPH`: request graph-aware retrieval/add when supported by backend.
@@ -258,6 +331,12 @@ OpenMemory (`openmemory.env`):
 - `OPENAI_API_KEY`: your OpenRouter key (used for embeddings and fact extraction).
 - `OPENAI_BASE_URL`: `https://openrouter.ai/api/v1`.
 - `QDRANT_HOST`, `QDRANT_PORT`: Qdrant connection.
+- `MEM0_VERSION`: memory engine version.
+- `MEM0_GRAPH_STORE_JSON`: JSON config connecting OpenMemory to Neo4j.
+
+Neo4j:
+
+- `NEO4J_AUTH`: credentials in `user/password` format (e.g. `neo4j/change-me`).
 
 ## Notes
 
@@ -272,4 +351,7 @@ OpenMemory (`openmemory.env`):
 - `/v1/responses` is supported. If your upstream does not implement it, keep
   `useResponsesApi` disabled in LibreChat.
 - Default port is `8001` to avoid clashing with Mem0 OSS (default `8000`).
-- Optional graph backend profile is available in compose via `--profile graph`.
+- Graph-aware memory requires Neo4j and `MEM0_GRAPH_STORE_JSON` in `openmemory.env`.
+  When enabled, OpenMemory stores entity relationships (e.g. "User works at ESAB",
+  "ESAB is a welding company") and the gateway can include these relations in the
+  prompt via `MEM0_INCLUDE_RELATIONS_IN_PROMPT`.
