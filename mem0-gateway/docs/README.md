@@ -9,7 +9,7 @@ stay clean.
 - Receives `POST /v1/chat/completions` (and `/v1/responses`) from LibreChat.
 - Looks up relevant memories from Mem0 OSS, Mem0 Platform, or OpenMemory API.
 - Injects those memories into the prompt.
-- Forwards the request to your upstream model provider.
+- Forwards the request to your upstream model provider (recommended: LiteLLM).
 - Optionally stores new memories in the selected memory backend.
 
 ## Quick start
@@ -36,13 +36,15 @@ copy config\.env.example .env
 cp config/.env.example .env
 ```
 
-For OpenRouter (gateway upstream), set:
+For LiteLLM + OpenRouter (recommended), set:
 
 ```text
-UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
-UPSTREAM_API_KEY=your-openrouter-key
-UPSTREAM_HEADERS={"HTTP-Referer":"https://your-domain","X-Title":"LibreChat"}
+UPSTREAM_BASE_URL=http://litellm:4000
+UPSTREAM_API_KEY=your-litellm-key
+UPSTREAM_HEADERS={}
 ```
+
+LiteLLM should then be configured to route to OpenRouter using your OpenRouter key.
 
 4) Run
 
@@ -55,6 +57,7 @@ npm start
 ```bash
 cd mem0-gateway/compose
 copy openmemory.env.example openmemory.env
+copy litellm.env.example litellm.env
 copy ..\config\.env.example ..\.env
 docker compose up
 ```
@@ -62,6 +65,7 @@ docker compose up
 ```bash
 cd mem0-gateway/compose
 cp openmemory.env.example openmemory.env
+cp litellm.env.example litellm.env
 cp ../config/.env.example ../.env
 docker compose up
 ```
@@ -69,6 +73,7 @@ docker compose up
 This starts:
 - OpenMemory API: `http://localhost:8765`
 - Gateway: `http://localhost:8001`
+- LiteLLM Proxy: `http://localhost:4000`
 - Qdrant dashboard (vector inspection): `http://localhost:6333/dashboard`
 - Neo4j browser (graph inspection, graph profile enabled): `http://localhost:7474`
 
@@ -77,6 +82,19 @@ Mem0 compatibility routes exposed by the API service:
 - `GET|PUT|DELETE /v1/memories/{memory_id}/`
 - `POST /v2/memories/search/`
 - `POST /v2/memories/`
+
+Optional hardening (recommended after first boot):
+
+1) Create a dedicated LiteLLM virtual key for the gateway:
+
+```bash
+curl -X POST http://localhost:4000/key/generate \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"key_alias":"mem0-gateway","duration":"720h"}'
+```
+
+2) Update `UPSTREAM_API_KEY` in `compose/litellm.env` to the generated key and restart compose.
 
 ## LibreChat config (minimal change)
 
@@ -101,10 +119,10 @@ memory:
 
 - `GATEWAY_API_KEY`: required if you want to protect the gateway.
 - `BODY_LIMIT`: JSON body size limit for gateway requests (default `25mb` for multimodal payloads).
-- `UPSTREAM_BASE_URL`: model API base URL (e.g. `https://api.openai.com`).
-- `UPSTREAM_API_KEY`: model API key.
+- `UPSTREAM_BASE_URL`: upstream OpenAI-compatible API base URL (e.g. `http://litellm:4000`).
+- `UPSTREAM_API_KEY`: upstream API key (for LiteLLM, use a virtual key after bootstrap).
 - `UPSTREAM_HEADERS`: optional JSON string of extra headers.
-  - OpenRouter often expects `HTTP-Referer` and `X-Title`.
+  - Keep `{}` when LiteLLM handles provider-specific headers.
 - `MEM0_MODE`: `oss`, `platform`, `openmemory`, or `mem0_compat`.
 - `MEM0_API_BASE`: backend API base URL (`http://mem0-api:8000` or `http://openmemory-api:8765`).
 - `MEM0_API_KEY`: Mem0 API key (platform or protected OSS).
@@ -147,6 +165,14 @@ memory:
 - `OPENMEMORY_USER_ID`: when set, gateway uses this fixed user for all memory operations.
 - `OPENMEMORY_APP`: app label stored in OpenMemory (`librechat` by default).
 - `AVAILABLE_MODELS`: comma-separated list for `/v1/models`.
+
+LiteLLM compose env (`compose/litellm.env`):
+
+- `LITELLM_MASTER_KEY`: LiteLLM admin key.
+- `UPSTREAM_API_KEY`: key used by Mem0 gateway when calling LiteLLM.
+- `DATABASE_URL`: Postgres connection for LiteLLM key/budget persistence.
+- `OPENROUTER_API_KEY`: key used by LiteLLM when routing to OpenRouter.
+- `OPENROUTER_HTTP_REFERER`, `OPENROUTER_X_TITLE`: optional OpenRouter attribution headers.
 
 ## Notes
 

@@ -1,0 +1,12 @@
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: openrouter/*
+      api_key: os.environ/OPENROUTER_API_KEY
+      extra_headers:
+        HTTP-Referer: os.environ/OPENROUTER_HTTP_REFERER
+        X-Title: os.environ/OPENROUTER_X_TITLE
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
