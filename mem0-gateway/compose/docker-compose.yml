@@ -7,29 +7,6 @@ services:
     volumes:
       - mem0_storage:/qdrant/storage
 
-  litellm-db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: litellm
-      POSTGRES_USER: litellm
-      POSTGRES_PASSWORD: litellm
-    volumes:
-      - litellm_db:/var/lib/postgresql/data
-
-  litellm:
-    image: ghcr.io/berriai/litellm:main-latest
-    restart: unless-stopped
-    env_file:
-      - ./litellm.env
-    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "4"]
-    volumes:
-      - ./litellm-config.yaml:/app/config.yaml:ro
-    depends_on:
-      - litellm-db
-    ports:
-      - "4000:4000"
-
   openmemory-api:
     image: openmemory-api-local
     build:
@@ -43,7 +20,6 @@ services:
       - openmemory_db:/data
     depends_on:
       - mem0-store
-      - litellm
     ports:
       - "8765:8765"
 
@@ -76,10 +52,8 @@ services:
         CMD ["node", "src/server.js"]
     env_file:
       - ../.env
-      - ./litellm.env
     depends_on:
       - openmemory-api
-      - litellm
     ports:
       - "8001:8001"
 
@@ -87,4 +61,3 @@ volumes:
   mem0_storage:
   openmemory_db:
   neo4j_data:
-  litellm_db:

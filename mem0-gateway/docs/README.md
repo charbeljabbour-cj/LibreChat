@@ -9,8 +9,27 @@ stay clean.
 - Receives `POST /v1/chat/completions` (and `/v1/responses`) from LibreChat.
 - Looks up relevant memories from Mem0 OSS, Mem0 Platform, or OpenMemory API.
 - Injects those memories into the prompt.
-- Forwards the request to your upstream model provider (recommended: LiteLLM).
+- Forwards the request to your upstream model provider (e.g. OpenRouter).
 - Optionally stores new memories in the selected memory backend.
+
+## Architecture
+
+```
+LibreChat
+    |
+    v
+mem0-gateway:8001  ------>  OpenRouter (or any OpenAI-compatible API)
+    |
+    +-- search/store memories
+    |
+    v
+openmemory-api:8765
+    |
+    v
+Qdrant:6333 (vector DB)
+```
+
+Three services, no extra databases.
 
 ## Quick start
 
@@ -28,23 +47,23 @@ npm install
 
 3) Copy env template and edit
 
+**Windows:**
 ```bash
 copy config\.env.example .env
 ```
 
+**Linux / macOS:**
 ```bash
 cp config/.env.example .env
 ```
 
-For LiteLLM + OpenRouter (recommended), set:
+Set your OpenRouter key:
 
 ```text
-UPSTREAM_BASE_URL=http://litellm:4000
-UPSTREAM_API_KEY=your-litellm-key
-UPSTREAM_HEADERS={}
+UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
+UPSTREAM_API_KEY=your-openrouter-key
+UPSTREAM_HEADERS={"HTTP-Referer":"https://your-domain","X-Title":"LibreChat"}
 ```
-
-LiteLLM should then be configured to route to OpenRouter using your OpenRouter key.
 
 4) Run
 
@@ -52,30 +71,29 @@ LiteLLM should then be configured to route to OpenRouter using your OpenRouter k
 npm start
 ```
 
-## Docker compose (Mem0 OSS stack)
+## Docker compose (full stack)
 
+**Windows:**
 ```bash
-cd mem0-gateway/compose
+cd mem0-gateway\compose
 copy openmemory.env.example openmemory.env
-copy litellm.env.example litellm.env
 copy ..\config\.env.example ..\.env
 docker compose up
 ```
 
+**Linux / macOS:**
 ```bash
 cd mem0-gateway/compose
 cp openmemory.env.example openmemory.env
-cp litellm.env.example litellm.env
 cp ../config/.env.example ../.env
 docker compose up
 ```
 
 This starts:
-- OpenMemory API: `http://localhost:8765`
 - Gateway: `http://localhost:8001`
-- LiteLLM Proxy: `http://localhost:4000`
+- OpenMemory API: `http://localhost:8765`
 - Qdrant dashboard (vector inspection): `http://localhost:6333/dashboard`
-- Neo4j browser (graph inspection, graph profile enabled): `http://localhost:7474`
+- Neo4j browser (graph profile only): `http://localhost:7474`
 
 Mem0 compatibility routes exposed by the API service:
 - `POST /v1/memories/`
@@ -83,18 +101,85 @@ Mem0 compatibility routes exposed by the API service:
 - `POST /v2/memories/search/`
 - `POST /v2/memories/`
 
-Optional hardening (recommended after first boot):
+## Azure deployment
 
-1) Create a dedicated LiteLLM virtual key for the gateway:
+If you are hosting LibreChat on Azure (e.g. Azure Container Apps, AKS, or a VM
+with Docker), you can add the mem0 gateway alongside your existing deployment.
 
-```bash
-curl -X POST http://localhost:4000/key/generate \
-  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"key_alias":"mem0-gateway","duration":"720h"}'
+### What you need
+
+| Service | Runs as | Notes |
+|---|---|---|
+| **mem0-gateway** | Container | Stateless proxy, scale horizontally |
+| **openmemory-api** | Container | Memory backend |
+| **Qdrant** | Container | Vector store, persist the volume |
+
+All three communicate over an **internal network** (Azure VNet or Container Apps
+environment). Only LibreChat is exposed publicly.
+
+### Step-by-step
+
+1) **Add the three containers** to your existing deployment (Container Apps,
+   AKS namespace, or docker-compose on a VM). Use the same `docker-compose.yml`
+   from this repo or translate the services into your deployment manifests.
+
+2) **Set environment variables** for the gateway (`.env`):
+
+```text
+GATEWAY_API_KEY=<generate-a-strong-key>
+UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
+UPSTREAM_API_KEY=<your-openrouter-key>
+UPSTREAM_HEADERS={"HTTP-Referer":"https://your-domain","X-Title":"LibreChat"}
 ```
 
-2) Update `UPSTREAM_API_KEY` in `compose/litellm.env` to the generated key and restart compose.
+3) **Set environment variables** for OpenMemory (`openmemory.env`):
+
+```text
+OPENAI_API_KEY=<your-openrouter-key>
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+QDRANT_HOST=mem0-store
+QDRANT_PORT=6333
+```
+
+4) **Configure LibreChat** (`librechat.yaml`):
+
+```yaml
+endpoints:
+  custom:
+    - name: mem0-gateway
+      apiKey: "${MEM0_GATEWAY_API_KEY}"
+      baseURL: "http://mem0-gateway:8001/v1"
+      headers:
+        X-User-Id: "{{LIBRECHAT_USER_ID}}"
+        X-Conversation-Id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      models:
+        default:
+          - openrouter/auto
+          - gpt-4.1-mini
+          - anthropic/claude-sonnet-4
+
+memory:
+  disabled: true
+```
+
+5) **Store secrets** in Azure Key Vault instead of `.env` files and reference
+   them in your container configuration.
+
+6) **Persist Qdrant data** by mounting a persistent volume on the `mem0-store`
+   container at `/qdrant/storage`.
+
+### Networking
+
+- The gateway, OpenMemory API, and Qdrant should only be reachable from within
+  your internal network. Do not expose ports 8001, 8765, or 6333 publicly.
+- LibreChat reaches the gateway over the internal network using its service name
+  (e.g. `http://mem0-gateway:8001/v1`).
+
+### Backups
+
+- **Qdrant**: back up the persistent volume (`mem0_storage`).
+- **OpenMemory**: back up `/data/openmemory.db` (SQLite file inside the
+  `openmemory_db` volume).
 
 ## LibreChat config (minimal change)
 
@@ -117,12 +202,14 @@ memory:
 
 ## Environment variables
 
+Gateway (`.env`):
+
 - `GATEWAY_API_KEY`: required if you want to protect the gateway.
 - `BODY_LIMIT`: JSON body size limit for gateway requests (default `25mb` for multimodal payloads).
-- `UPSTREAM_BASE_URL`: upstream OpenAI-compatible API base URL (e.g. `http://litellm:4000`).
-- `UPSTREAM_API_KEY`: upstream API key (for LiteLLM, use a virtual key after bootstrap).
+- `UPSTREAM_BASE_URL`: upstream OpenAI-compatible API base URL (e.g. `https://openrouter.ai/api/v1`).
+- `UPSTREAM_API_KEY`: upstream API key (your OpenRouter key).
 - `UPSTREAM_HEADERS`: optional JSON string of extra headers.
-  - Keep `{}` when LiteLLM handles provider-specific headers.
+  - OpenRouter expects `HTTP-Referer` and `X-Title`.
 - `MEM0_MODE`: `oss`, `platform`, `openmemory`, or `mem0_compat`.
 - `MEM0_API_BASE`: backend API base URL (`http://mem0-api:8000` or `http://openmemory-api:8765`).
 - `MEM0_API_KEY`: Mem0 API key (platform or protected OSS).
@@ -159,20 +246,18 @@ memory:
 - `MEM0_FORGET_SETTLE_MS`: wait time between forget cleanup passes.
 - `MEM0_AGENT_ID`, `MEM0_RUN_ID`, `MEM0_APP_ID`, `MEM0_ORG_ID`, `MEM0_PROJECT_ID`: default scope values.
 - `MEM0_USE_CONVERSATION_AS_RUN_ID`: map LibreChat conversation ID to `run_id`.
-- `MEM0_CUSTOM_FACT_EXTRACTION_PROMPT`: override extraction prompt (gateway/api safety layer enforces JSON + `{"facts": [...]}` response shape hints).
-- `MEM0_CUSTOM_UPDATE_MEMORY_PROMPT`: override update prompt (safety layer enforces JSON action schema hints).
+- `MEM0_CUSTOM_FACT_EXTRACTION_PROMPT`: override extraction prompt (safety layer appends JSON schema hints).
+- `MEM0_CUSTOM_UPDATE_MEMORY_PROMPT`: override update prompt (safety layer appends JSON action schema hints).
 - `MEM0_INJECT_ROLE`: usually `system`.
 - `OPENMEMORY_USER_ID`: when set, gateway uses this fixed user for all memory operations.
 - `OPENMEMORY_APP`: app label stored in OpenMemory (`librechat` by default).
 - `AVAILABLE_MODELS`: comma-separated list for `/v1/models`.
 
-LiteLLM compose env (`compose/litellm.env`):
+OpenMemory (`openmemory.env`):
 
-- `LITELLM_MASTER_KEY`: LiteLLM admin key.
-- `UPSTREAM_API_KEY`: key used by Mem0 gateway when calling LiteLLM.
-- `DATABASE_URL`: Postgres connection for LiteLLM key/budget persistence.
-- `OPENROUTER_API_KEY`: key used by LiteLLM when routing to OpenRouter.
-- `OPENROUTER_HTTP_REFERER`, `OPENROUTER_X_TITLE`: optional OpenRouter attribution headers.
+- `OPENAI_API_KEY`: your OpenRouter key (used for embeddings and fact extraction).
+- `OPENAI_BASE_URL`: `https://openrouter.ai/api/v1`.
+- `QDRANT_HOST`, `QDRANT_PORT`: Qdrant connection.
 
 ## Notes
 
