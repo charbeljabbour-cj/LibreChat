@@ -72,6 +72,8 @@ const config = {
   openmemoryApp: process.env.OPENMEMORY_APP || 'librechat',
   openmemoryAppIncludeUserId: process.env.OPENMEMORY_APP_INCLUDE_USER_ID === 'true',
   openmemoryInfer: process.env.OPENMEMORY_INFER === 'true',
+  modelsSourceUrl: process.env.MODELS_SOURCE_URL || '',
+  modelsSourceApiKey: process.env.MODELS_SOURCE_API_KEY || '',
   logLevel: process.env.LOG_LEVEL || 'info',
 };
 
@@ -86,7 +88,6 @@ const log = {
 
 const pendingMemoryWritesByScope = new Map();
 const forgottenTopicTokensByScope = new Map();
-
 function getScopeQueueKey(scope) {
   const user = scope?.userId || '-';
   const agent = scope?.agentId || '-';
@@ -1583,13 +1584,14 @@ function parseResponsesStreamingDelta(state, chunk) {
   }
 }
 
-function buildUpstreamHeaders() {
+function buildUpstreamHeaders(apiKeyOverride) {
   const headers = {
     'Content-Type': 'application/json',
   };
 
-  if (config.upstreamApiKey) {
-    headers.Authorization = `Bearer ${config.upstreamApiKey}`;
+  const key = apiKeyOverride || config.upstreamApiKey;
+  if (key) {
+    headers.Authorization = `Bearer ${key}`;
   }
 
   const extraHeaders = parseJsonEnv(config.upstreamHeaders, {});
@@ -1649,9 +1651,9 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/v1/models', requireApiKey, (req, res) => {
-  const upstreamBase = normalizeBaseUrl(config.upstreamBaseUrl);
+  const modelsBase = normalizeBaseUrl(config.modelsSourceUrl) || normalizeBaseUrl(config.upstreamBaseUrl);
 
-  if (!upstreamBase) {
+  if (!modelsBase) {
     const models = (process.env.AVAILABLE_MODELS || '')
       .split(',')
       .map((model) => model.trim())
@@ -1660,18 +1662,30 @@ app.get('/v1/models', requireApiKey, (req, res) => {
     return res.json({ object: 'list', data: models });
   }
 
+  const modelsHeaders = { 'Content-Type': 'application/json' };
+  const modelsApiKey = config.modelsSourceApiKey || config.upstreamApiKey;
+  if (modelsApiKey) {
+    modelsHeaders.Authorization = `Bearer ${modelsApiKey}`;
+  }
+  if (config.modelsSourceUrl) {
+    const extraHeaders = parseJsonEnv(config.upstreamHeaders, {});
+    Object.assign(modelsHeaders, extraHeaders);
+  } else {
+    Object.assign(modelsHeaders, buildUpstreamHeaders());
+  }
+
   return fetchWithTimeout(
-    `${upstreamBase}/v1/models`,
+    `${modelsBase}/v1/models`,
     {
       method: 'GET',
-      headers: buildUpstreamHeaders(),
+      headers: modelsHeaders,
     },
     config.upstreamTimeoutMs,
   )
     .then(async (upstreamResponse) => {
       if (!upstreamResponse.ok) {
         const text = await upstreamResponse.text();
-        log.warn('Upstream model list fetch failed', upstreamResponse.status, text);
+        log.warn('Model list fetch failed', upstreamResponse.status, text);
         const fallback = (process.env.AVAILABLE_MODELS || '')
           .split(',')
           .map((model) => model.trim())
@@ -1693,7 +1707,7 @@ app.get('/v1/models', requireApiKey, (req, res) => {
       return res.json({ object: 'list', data: fallback });
     })
     .catch((error) => {
-      log.warn('Upstream model list fetch error', error.message);
+      log.warn('Model list fetch error', error.message);
       const fallback = (process.env.AVAILABLE_MODELS || '')
         .split(',')
         .map((model) => model.trim())
@@ -1732,6 +1746,10 @@ app.post('/v1/chat/completions', requireApiKey, async (req, res) => {
     ...body,
     messages: nextMessages,
   };
+
+  if (scope.userId) {
+    upstreamBody.user = scope.userId;
+  }
 
   const upstreamBase = normalizeBaseUrl(config.upstreamBaseUrl);
   if (!upstreamBase) {
@@ -1871,6 +1889,10 @@ app.post('/v1/responses', requireApiKey, async (req, res) => {
 
   const memoryPrompt = buildMemoryPrompt(memories, { forgetResult });
   const upstreamBody = { ...body };
+
+  if (scope.userId) {
+    upstreamBody.user = scope.userId;
+  }
 
   if (memoryPrompt) {
     if (Array.isArray(input)) {

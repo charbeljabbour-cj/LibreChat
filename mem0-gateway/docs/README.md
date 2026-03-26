@@ -107,6 +107,10 @@ Mem0 compatibility routes exposed by the API service:
 
 ## Azure deployment
 
+> **Full guide:** [AZURE_DEPLOYMENT.md](./AZURE_DEPLOYMENT.md) — a standalone
+> walkthrough covering image builds, compose setup, env configuration, and
+> production hardening.
+
 If you are hosting LibreChat on Azure (e.g. Azure Container Apps, AKS, or a VM
 with Docker Compose), you can add the mem0 gateway stack alongside your existing
 deployment. Nothing in LibreChat itself changes — you only add a custom endpoint
